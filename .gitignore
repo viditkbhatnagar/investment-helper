@@ -1,0 +1,11 @@
+# ignore virtual environment
+venv/
+# ignore model artefacts & data
+models/
+data/
+*.parquet
+*.pkl
+*.h5
+# caches
+__pycache__/
+.DS_Store

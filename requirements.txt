@@ -1,0 +1,18 @@
+pandas>=2.2
+numpy
+yfinance
+nsepy
+requests
+prophet
+tensorflow~=2.16
+lightgbm
+scikit-learn
+pyportfolioopt
+shap
+mlflow
+plotly
+streamlit
+streamlit-extras   # themes, card components
+yfinance>=0.2.61
+requests>=2.31.0
+ta>=0.10.1
