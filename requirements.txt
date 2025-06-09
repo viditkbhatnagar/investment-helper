@@ -10,3 +10,4 @@ plotly>=5.0
 ta>=0.10.1
 prophet
 mlflow
+tensorflow
