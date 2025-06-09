@@ -8,6 +8,7 @@ lightgbm>=4.0
 scikit-learn>=1.2
 plotly>=5.0
 ta>=0.10.1
-# prophet           ← remove, no Python 3.13 wheel  
-# tensorflow        ← remove, no Python 3.13 wheel  
-# mlflow            ← remove or vendor elsewhere
+pystan==2.19.1.1
+prophet==1.1.7
+mlflow
+tensorflow
