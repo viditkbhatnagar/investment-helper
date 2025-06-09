@@ -1,12 +1,10 @@
+streamlit>=1.20
 pandas>=2.2
-numpy
-yfinance
-nsepy
-requests
-# Removed tensorflow and prophet (not yet available for Python 3.13 in pip wheels)
-# You can install them locally in a compatible environment or via conda.
-streamlit
-plotly
-lightgbm
-tensorflow-macos==2.11.*  # if deploying on macOS runner or local Apple silicon
-prophet==1.1.1            # pin to a version that supports your local Python (use conda)
+numpy>=1.24
+yfinance>=0.2.60
+nsepy>=0.8
+requests>=2.31
+lightgbm>=4.0
+scikit-learn>=1.2
+plotly>=5.0
+ta>=0.10.1
