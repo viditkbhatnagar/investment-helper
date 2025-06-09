@@ -3,16 +3,10 @@ numpy
 yfinance
 nsepy
 requests
-prophet
-tensorflow~=2.16
-lightgbm
-scikit-learn
-pyportfolioopt
-shap
-mlflow
-plotly
+# Removed tensorflow and prophet (not yet available for Python 3.13 in pip wheels)
+# You can install them locally in a compatible environment or via conda.
 streamlit
-streamlit-extras   # themes, card components
-yfinance>=0.2.61
-requests>=2.31.0
-ta>=0.10.1
+plotly
+lightgbm
+tensorflow-macos==2.11.*  # if deploying on macOS runner or local Apple silicon
+prophet==1.1.1            # pin to a version that supports your local Python (use conda)
