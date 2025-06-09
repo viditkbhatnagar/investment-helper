@@ -1,7 +1,8 @@
 # ignore virtual environment
 venv/
 # ignore model artefacts & data
-models/
+/models/
+!src/models/
 data/
 *.parquet
 *.pkl
