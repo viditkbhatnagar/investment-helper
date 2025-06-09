@@ -1,8 +1,16 @@
 import streamlit as st
-import os, sys
+import os
+import sys
+
+# Compute project root and src directory
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+SRC_PATH = os.path.join(PROJECT_ROOT, "src")
+
+# Prepend to sys.path so that imports from src.* work
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+if SRC_PATH not in sys.path:
+    sys.path.insert(0, SRC_PATH)
 
 from src.live_data import (
     get_live_all_stocks,
