@@ -9,3 +9,4 @@ scikit-learn>=1.2
 plotly>=5.0
 ta>=0.10.1
 prophet
+mlflow
