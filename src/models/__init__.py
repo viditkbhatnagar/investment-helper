@@ -8,7 +8,7 @@ Re-exports:
     - ensemble      (ensemble_forecast)
 """
 
-from .prophet_model import load_prophet, forecast_prophet  # noqa: F401
-from .lstm_model import load_lstm, predict_price           # noqa: F401
-from .lightgbm_model import load_lgbm, predict_price   # noqa: F401    # noqa: F401
-from .ensemble import ensemble_forecast                    # noqa: F401
+from .prophet_model import train_prophet, load_prophet, forecast_prophet  # noqa: F401
+from .lstm_model      import load_lstm, predict_price as predict_price_lstm           # noqa: F401
+from .lightgbm_model  import load_lgbm, predict_price as predict_price_lgbm   # noqa: F401    # noqa: F401
+from .ensemble import load_latest_models, predict as ensemble_forecast
