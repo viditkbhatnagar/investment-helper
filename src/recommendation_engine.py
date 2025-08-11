@@ -20,6 +20,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from src.portfolio.optimizer import allocate_from_forecasts
+from src.data_ingestion import fetch_fundamentals
 
 from src.live_data import get_live_stock_quotes
 from src.feature_engineering import transform_live
@@ -84,13 +85,21 @@ def get_recommendations(
             model = load_prophet(sym)
             future = pd.DataFrame({"ds": [today + _dt.timedelta(days=horizon_days)]})
             yhat = forecast_prophet(model, future)["yhat"].iloc[-1]
-        except FileNotFoundError:
+        except Exception:
             # Fallback: naive one-day momentum forecast
             raw_change = feats[sym].get("raw_chg_pct", feats[sym].get("pct_chg", 0)) or 0.0
             yhat = price_now * (1 + raw_change)
 
         cagr = _expected_cagr(price_now, yhat, horizon)
         risk_score = _risk_proxy(feats[sym])
+        if not risk_score or risk_score == 0.0:
+            # Fallback to fundamentals beta if available
+            try:
+                beta = float(fetch_fundamentals(sym).get("beta") or 0.0)
+                # Normalise beta into ~[0,1.5] range for simple ranking
+                risk_score = max(0.0, beta)
+            except Exception:
+                pass
 
         forecast_records.append(
             {
@@ -130,4 +139,4 @@ def get_recommendations(
     # 6. Placeholder PDF (to be implemented) ------------------------
     pdf_bytes = b""
 
-    return portfolio_df, alloc_fig, forecast_fig, pdf_bytes
+    return portfolio_df, alloc_fig, forecast_fig, pdf_bytes, perf

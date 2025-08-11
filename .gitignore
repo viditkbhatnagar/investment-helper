@@ -10,3 +10,12 @@ data/
 # caches
 __pycache__/
 .DS_Store
+venv/
+.env
+node_modules/
+__pycache__/
+.pytest_cache/
+models/*.pkl
+models/*.h5
+models/*.json
+data/*.parquet

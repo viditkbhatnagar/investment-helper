@@ -11,3 +11,16 @@ ta>=0.10.1
 prophet
 mlflow
 tensorflow
+fastapi>=0.111
+uvicorn[standard]>=0.30
+pydantic>=2.7
+motor>=3.6
+aiohttp>=3.9
+anthropic>=0.34
+beautifulsoup4>=4.12
+selenium>=4.21
+scrapy>=2.11
+langchain>=0.2
+langgraph>=0.1.19
+google-cloud-bigquery>=3.25
+psycopg2-binary>=2.9
