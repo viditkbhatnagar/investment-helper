@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+
+# FastAPI/UVicorn
+*.log
+
+# Node/Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/.turbo/
+frontend/.vercel/
+
+# MacOS
+.DS_Store
+
+# VSCode
+.vscode/
+
+# Local data
+*.sqlite
+*.db
+
+# Selenium/Drivers
+*.crdownload
+
+
