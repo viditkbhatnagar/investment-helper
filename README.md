@@ -33,15 +33,15 @@ This project is a full‑stack research and forecasting assistant for Indian equ
 ## Architecture
 ```mermaid
 flowchart LR
-  subgraph FE[Frontend (Next.js)]
+  subgraph FE[Frontend Nextjs]
     RECO[/Recommend Page/]
-    DISK[(Model Bundles on Disk)]
   end
-  subgraph BE[Backend (FastAPI)]
+  subgraph BE[Backend FastAPI]
     R[routers/*]
     S[services/*]
     DB[(MongoDB)]
     BQ[(BigQuery)]
+    DISK[(Model Bundles on Disk)]
   end
   subgraph EXT[External]
     IND[Indian Stock API]
@@ -124,9 +124,9 @@ Each day per symbol we write:
 ### LangGraph topology
 ```mermaid
 flowchart TD
-  START([START]) --> FETCH[fetch context (industry, API news)]
+  START([START]) --> FETCH[fetch context: industry + API news]
   FETCH --> SCRAPE[scrape web + scrapy + selenium]
-  SCRAPE --> ANALYZE[Claude: extract facts + plan]
+  SCRAPE --> ANALYZE[Claude extract facts + plan]
   ANALYZE --> PEERS[peer aggregates + AI numeric factors]
   PEERS --> END([Return state + persist])
 ```
