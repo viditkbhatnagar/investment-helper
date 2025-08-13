@@ -20,6 +20,7 @@ lightgbm==4.5.0
 scipy==1.16.1
 optuna==3.6.1
 shap==0.44.1
+keras-tuner==1.4.7
 beautifulsoup4==4.12.3
 lxml==5.2.2
 scrapy==2.11.2

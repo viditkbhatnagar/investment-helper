@@ -8,6 +8,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+from sklearn.model_selection import train_test_split
 import pickle
 import base64
 import hashlib
@@ -20,6 +21,7 @@ import json
 from app.services import indian_api
 from app.services import aggregation
 from app.services import bq
+from app.services import model_store
 import asyncio
 import math
 
@@ -94,25 +96,51 @@ def _extract_price_series(historical_doc: dict) -> pd.DataFrame:
 
 
 def _build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Price-derived technical features including MACD, RSI, and moving averages.
+    Ensures no NaNs/Infs are returned.
+    """
     if df.empty:
         return df
     out = df.copy()
     out["ret_1d"] = out["close"].pct_change()
     out["dma_20"] = out["close"].rolling(20).mean()
     out["dma_50"] = out["close"].rolling(50).mean()
+    out["dma_100"] = out["close"].rolling(100).mean()
+    out["dma_200"] = out["close"].rolling(200).mean()
     out["vol_20"] = out["ret_1d"].rolling(20).std()
     out["mom_10"] = out["close"].pct_change(10)
     # price relative to moving averages
     out["close_over_dma20"] = out["close"] / out["dma_20"]
     out["close_over_dma50"] = out["close"] / out["dma_50"]
+    out["close_over_dma100"] = out["close"] / out["dma_100"]
+    out["close_over_dma200"] = out["close"] / out["dma_200"]
     # momentum indicators
     out["mom_5"] = out["close"].pct_change(5)
     out["mom_20"] = out["close"].pct_change(20)
     # rolling max/min proximity (approximate 52w within our window if needed)
     out["roll_max_60"] = out["close"].rolling(60).max()
     out["roll_min_60"] = out["close"].rolling(60).min()
-    out["prox_roll_60"] = (out["close"] - (out["roll_min_60"] + out["roll_max_60"]) / 2) / (out["roll_max_60"] - out["roll_min_60"]).replace(0, np.nan)
-    out = out.dropna()
+    denom = (out["roll_max_60"] - out["roll_min_60"]).replace(0, np.nan)
+    out["prox_roll_60"] = (out["close"] - (out["roll_min_60"] + out["roll_max_60"]) / 2) / denom
+    # RSI(14)
+    window_rsi = 14
+    delta = out["close"].diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.rolling(window_rsi).mean()
+    avg_loss = loss.rolling(window_rsi).mean().replace(0, np.nan)
+    rs = avg_gain / avg_loss
+    out["rsi_14"] = 100 - (100 / (1 + rs))
+    # MACD (12, 26, 9)
+    ema12 = out["close"].ewm(span=12, adjust=False).mean()
+    ema26 = out["close"].ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    out["macd"] = macd
+    out["macd_signal"] = signal
+    out["macd_hist"] = macd - signal
+    # Cleanup
+    out = out.replace([np.inf, -np.inf], np.nan).dropna()
     return out
 
 
@@ -234,6 +262,228 @@ def _append_exog(df: pd.DataFrame, exog: Dict[str, float]) -> pd.DataFrame:
         except Exception:
             out[k] = 0.0
     return out
+
+
+# ============================
+# LSTM + Keras Tuner pipeline
+# ============================
+
+def _build_seq_dataset(data: pd.DataFrame, target_col: str, seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
+    X_list: List[np.ndarray] = []
+    y_list: List[float] = []
+    vals = data.values
+    tgt_idx = list(data.columns).index(target_col)
+    for i in range(seq_len, len(data)):
+        X_list.append(vals[i - seq_len : i, :])
+        y_list.append(vals[i, tgt_idx])
+    if not X_list:
+        return np.empty((0, seq_len, data.shape[1])), np.empty((0,))
+    return np.stack(X_list), np.array(y_list)
+
+
+def _train_lstm_tuned(feats: pd.DataFrame, horizon_days: int, exog: Dict[str, float]) -> Tuple[object, Dict[str, Any], List[str], int, object]:
+    """Train a tuned LSTM on normalized technical features predicting RETURNS.
+    Target is r_t = close_{t+h}/close_t - 1 to keep outputs near 0 and anchored to last price later.
+    Returns (model, metrics, feature_cols, seq_len, scaler).
+    If TensorFlow/Keras Tuner are unavailable or data is too small, falls back to LightGBM enriched model.
+    """
+    try:
+        import tensorflow as tf  # type: ignore
+        import keras_tuner as kt  # type: ignore
+        from tensorflow import keras  # type: ignore
+    except Exception:
+        mdl, met = _train_lgbm_enriched(feats, horizon_days, exog)
+        return mdl, met, met.get("features") or list(feats.columns), 30, None
+
+    data = _append_exog(feats.copy(), exog)
+    # target as forward return over horizon
+    data["target"] = (data["close"].shift(-horizon_days) / data["close"]) - 1.0
+    data = data.dropna()
+    if len(data) < 250:
+        mdl, met = _train_lgbm_enriched(feats, horizon_days, exog)
+        return mdl, met, met.get("features") or list(feats.columns), 30, None
+
+    feature_cols = [c for c in data.columns if c != "target"]
+    X_full = data[feature_cols].astype(float)
+    y_full = data["target"].astype(float)
+
+    # Time-ordered split: 70% train, 15% val, 15% test
+    n = len(data)
+    n_train = int(n * 0.7)
+    n_val = int(n * 0.15)
+    train_df = X_full.iloc[:n_train]
+    val_df = X_full.iloc[n_train : n_train + n_val]
+    test_df = X_full.iloc[n_train + n_val :]
+    y_train = y_full.iloc[:n_train]
+    y_val = y_full.iloc[n_train : n_train + n_val]
+    y_test = y_full.iloc[n_train + n_val :]
+
+    # Normalize using training stats only
+    scaler = StandardScaler()
+    scaler.fit(train_df.values)
+    train_n = pd.DataFrame(scaler.transform(train_df.values), index=train_df.index, columns=feature_cols)
+    val_n = pd.DataFrame(scaler.transform(val_df.values), index=val_df.index, columns=feature_cols)
+    test_n = pd.DataFrame(scaler.transform(test_df.values), index=test_df.index, columns=feature_cols)
+
+    seq_len = 30
+    # assemble datasets with the target aligned at end of each sequence
+    train_n["y"] = y_train
+    val_n["y"] = y_val
+    test_n["y"] = y_test
+
+    X_train, y_train_seq = _build_seq_dataset(train_n[feature_cols + ["y"]], target_col="y", seq_len=seq_len)
+    X_val, y_val_seq = _build_seq_dataset(val_n[feature_cols + ["y"]], target_col="y", seq_len=seq_len)
+    X_test, y_test_seq = _build_seq_dataset(test_n[feature_cols + ["y"]], target_col="y", seq_len=seq_len)
+
+    if X_train.shape[0] < 50 or X_val.shape[0] < 10:
+        mdl, met = _train_lgbm_enriched(feats, horizon_days, exog)
+        return mdl, met, met.get("features") or list(feats.columns), seq_len, None
+
+    input_shape = (seq_len, len(feature_cols))
+
+    def build_model(hp: "kt.HyperParameters"):
+        model = keras.Sequential()
+        units1 = hp.Int("units1", min_value=32, max_value=256, step=32)
+        model.add(keras.layers.LSTM(units1, return_sequences=hp.Boolean("return_seq", default=True), input_shape=input_shape))
+        model.add(keras.layers.Dropout(hp.Float("drop1", 0.0, 0.5, step=0.1)))
+        if hp.Boolean("stack_second", default=True):
+            units2 = hp.Int("units2", min_value=16, max_value=128, step=16)
+            model.add(keras.layers.LSTM(units2))
+            model.add(keras.layers.Dropout(hp.Float("drop2", 0.0, 0.5, step=0.1)))
+        model.add(keras.layers.Dense(hp.Int("dense", 16, 128, step=16), activation="relu"))
+        # Predict bounded return via tanh, then scale to a reasonable daily band (~15%)
+        model.add(keras.layers.Dense(1, activation="tanh"))
+        model.add(keras.layers.Lambda(lambda x: 0.15 * x))
+        lr = hp.Choice("lr", values=[1e-4, 3e-4, 1e-3])
+        model.compile(optimizer=keras.optimizers.Adam(learning_rate=lr), loss="mae", metrics=[keras.metrics.MAE, keras.metrics.MAPE])
+        return model
+
+    tuner = kt.RandomSearch(
+        build_model,
+        objective=kt.Objective("val_mae", direction="min"),
+        max_trials=6,
+        overwrite=True,
+        directory="/tmp/keras_tuner",
+        project_name=f"lstm_{horizon_days}d",
+    )
+
+    early = keras.callbacks.EarlyStopping(monitor="val_mae", patience=5, restore_best_weights=True)
+    tuner.search(
+        X_train,
+        y_train_seq,
+        epochs=30,
+        validation_data=(X_val, y_val_seq),
+        callbacks=[early],
+        verbose=0,
+    )
+    model = tuner.get_best_models(num_models=1)[0]
+
+    # Evaluate (MAE/MAPE on returns)
+    def _eval(x, y):
+        res = model.evaluate(x, y, verbose=0)
+        # res aligns with [loss, mae, mape]
+        mae_val = float(res[1] if len(res) > 1 else res)
+        mape_val = float(res[2]) if len(res) > 2 else float("nan")
+        return mae_val, mape_val
+
+    train_mae, train_mape = _eval(X_train, y_train_seq)
+    val_mae, val_mape = _eval(X_val, y_val_seq)
+    test_mae, test_mape = _eval(X_test, y_test_seq)
+    val_gap = float(val_mae - train_mae)
+
+    metrics = {
+        "model": "lstm",
+        "horizon": float(horizon_days),
+        "n_train": int(len(y_train_seq)),
+        "n_val": int(len(y_val_seq)),
+        "n_test": int(len(y_test_seq)),
+        "train_mae": float(train_mae),
+        "val_mae": float(val_mae),
+        "test_mae": float(test_mae),
+        "train_mape": float(train_mape),
+        "val_mape": float(val_mape),
+        "test_mape": float(test_mape),
+        "val_gap": float(val_gap),
+        "features": feature_cols,
+        "seq_len": int(seq_len),
+    }
+
+    return model, metrics, feature_cols, seq_len, scaler
+
+
+def _train_lgbm_return_enriched(df: pd.DataFrame, horizon_days: int, exog: Dict[str, float]) -> Tuple[object, Dict[str, Any], List[str], StandardScaler]:
+    """LightGBM on forward returns r = close(t+h)/close(t) - 1. More stable and anchored.
+    Returns: (model, metrics) where metrics includes mae_ret, mape_ret, and features.
+    """
+    try:
+        import lightgbm as lgb
+    except Exception:
+        # Fallback: linear model on returns
+        data = _append_exog(df.copy(), exog)
+        data["target"] = (data["close"].shift(-horizon_days) / data["close"]) - 1.0
+        data = data.dropna()
+        feature_cols = [c for c in data.columns if c != "target"]
+        X = data[feature_cols].values
+        y = data["target"].values
+        scaler = StandardScaler()
+        Xs = scaler.fit_transform(X)
+        model = Pipeline([("scaler", StandardScaler(with_mean=False)), ("lin", LinearRegression())])
+        split = int(len(data) * 0.8)
+        model.fit(Xs[:split], y[:split])
+        from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+        if split < len(data):
+            pred = model.predict(Xs[split:])
+            mae = float(mean_absolute_error(y[split:], pred))
+            try:
+                mape = float(mean_absolute_percentage_error(y[split:], pred))
+            except Exception:
+                mape = float("nan")
+        else:
+            mae, mape = float("nan"), float("nan")
+        return model, {"mae_ret": mae, "mape_ret": mape, "features": feature_cols}, feature_cols, scaler
+
+    data = _append_exog(df.copy(), exog)
+    data["target"] = (data["close"].shift(-horizon_days) / data["close"]) - 1.0
+    data = data.dropna()
+    feature_cols = [c for c in data.columns if c != "target"]
+    X = data[feature_cols].values
+    y = data["target"].values
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+    if len(data) < 150:
+        # use baseline regression pipeline
+        model = Pipeline([("scaler", StandardScaler(with_mean=False)), ("lin", LinearRegression())])
+        split = int(len(data) * 0.8)
+        model.fit(Xs[:split], y[:split])
+        from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+        if split < len(data):
+            pred = model.predict(Xs[split:])
+            mae = float(mean_absolute_error(y[split:], pred))
+            try:
+                mape = float(mean_absolute_percentage_error(y[split:], pred))
+            except Exception:
+                mape = float("nan")
+        else:
+            mae, mape = float("nan"), float("nan")
+        return model, {"mae_ret": mae, "mape_ret": mape, "features": feature_cols}, feature_cols, scaler
+
+    split = int(len(data) * 0.8)
+    train = lgb.Dataset(Xs[:split], label=y[:split])
+    valid = lgb.Dataset(Xs[split:], label=y[split:]) if split < len(data) else None
+    params = {"objective": "regression", "metric": "l1", "verbosity": -1, "num_leaves": 63, "learning_rate": 0.05, "feature_fraction": 0.9}
+    model = lgb.train(params, train, num_boost_round=600, valid_sets=[valid] if valid else None)
+    from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+    mae = float("nan")
+    mape = float("nan")
+    if split < len(data):
+        pred = model.predict(Xs[split:])
+        mae = float(mean_absolute_error(y[split:], pred))
+        try:
+            mape = float(mean_absolute_percentage_error(y[split:], pred))
+        except Exception:
+            mape = float("nan")
+    metrics = {"mae_ret": mae, "mape_ret": mape, "n_samples": float(len(data)), "horizon": float(horizon_days), "features": feature_cols}
+    return model, metrics, feature_cols, scaler
 
 
 def _get_blend_alpha(lname_key: str, horizon_key: int) -> float:
@@ -646,13 +896,32 @@ def predict_enriched(symbol: str, horizons: List[int]) -> Dict[str, Any]:
         exog_keys = list(exog_vec.keys())
         fp = _make_fingerprint(feat_cols, exog_keys)
         for h in horizons:
+            # Base LightGBM enriched model on returns for stability
             cached = _load_model_cache(lname, h, fp)
-            if cached and cached.get("model") is not None:
+            if cached and cached.get("model") is not None and cached.get("metrics", {}).get("mae_ret") is not None:
                 model = cached["model"]
                 met = cached.get("metrics") or {}
             else:
-                model, met = _train_lgbm_enriched(feats, h, exog_vec)
-                _save_model_cache(lname, h, fp, model, met, met.get("features") or feat_cols)
+                model, met, norm_cols, scaler_feat = _train_lgbm_return_enriched(feats, h, exog_vec)
+                # persist normalized feature columns; we will normalize last row the same way
+                met = dict(met)
+                met["norm_cols"] = norm_cols
+                _save_model_cache(lname, h, fp, (model, scaler_feat), met, met.get("features") or feat_cols)
+                # also persist to local disk for reuse across sessions
+                try:
+                    bundle = {"model": model, "scaler": scaler_feat, "metrics": met, "features": met.get("features") or feat_cols}
+                    model_store.save_model_bundle(lname, h, bundle, kind="return_lgbm")
+                except Exception:
+                    pass
+            # try loading from disk if cache missing
+            if cached is None:
+                try:
+                    disk = model_store.load_model_bundle(lname, h, kind="return_lgbm")
+                    if isinstance(disk, dict) and disk.get("model") is not None:
+                        model = (disk.get("model"), disk.get("scaler"))
+                        met = disk.get("metrics") or {}
+                except Exception:
+                    pass
             last = _append_exog(feats.iloc[-1:].copy(), exog_vec)
             # Choose feature matrix based on model type
             try:
@@ -668,11 +937,87 @@ def predict_enriched(symbol: str, horizons: List[int]) -> Dict[str, Any]:
                     arr = last.reindex(columns=feature_cols, fill_value=0.0).values
                 else:
                     arr = last.values
-            point = float(model.predict(arr)[0])  # type: ignore[attr-defined]
-            spread = (met.get("mae") if met.get("mae") is not None and not np.isnan(met.get("mae", np.nan)) else float(feats["close"].std())) * (1 + h / 10)
+            try:
+                # If model predicts returns, convert to price anchored on last close
+                # Handle saved (model, scaler) tuple
+                scal = None
+                mdl = model
+                try:
+                    if isinstance(model, tuple) and len(model) == 2:
+                        mdl, scal = model  # type: ignore[misc]
+                except Exception:
+                    mdl = model
+                    scal = None
+                if isinstance(met.get("norm_cols"), list) and scal is not None:
+                    arr_df = pd.DataFrame(arr, columns=met.get("features") or last.columns)
+                    arr_df = arr_df.reindex(columns=met["norm_cols"], fill_value=0.0)
+                    arr = scal.transform(arr_df.values)
+                ret_hat_lgbm = float(mdl.predict(arr)[0])  # type: ignore[attr-defined]
+                base_close = float(feats["close"].iloc[-1])
+                if "mae_ret" in (met or {}):
+                    lgbm_point = float(base_close * (1.0 + ret_hat_lgbm))
+                else:
+                    lgbm_point = ret_hat_lgbm
+            except Exception:
+                lgbm_point = float(feats["close"].iloc[-1])
+            # Spread from LGBM validation MAE as uncertainty
+            spread_base = (met.get("mae") if met.get("mae") is not None and not np.isnan(met.get("mae", np.nan)) else float(feats["close"].std())) * (1 + h / 10)
+
+            # LSTM tuned model for robustness
+            lstm_model, lstm_metrics, lstm_feats, seq_len, scaler = _train_lstm_tuned(feats, h, exog_vec)
+            try:
+                # Prepare last sequence
+                last_seq_df = _append_exog(feats.tail(seq_len).copy(), exog_vec).reindex(columns=lstm_feats, fill_value=0.0)
+                if scaler is not None:
+                    last_seq_norm = scaler.transform(last_seq_df.values)
+                else:
+                    # fall back to identity
+                    last_seq_norm = last_seq_df.values
+                X_last = np.expand_dims(last_seq_norm, axis=0)
+                # LSTM outputs return; convert to price anchored on latest close
+                ret_hat = float(lstm_model.predict(X_last, verbose=0)[0][0])  # type: ignore[attr-defined]
+                base_close = float(feats["close"].iloc[-1])
+                lstm_point = float(base_close * (1.0 + ret_hat))
+            except Exception:
+                lstm_point = float(lgbm_point)
+
+            # Ensemble LGBM and LSTM using inverse validation MAE weights (convert LSTM return-MAE to price-MAE)
+            def _safe_mae(v, default: float):
+                try:
+                    vv = float(v)
+                    if np.isnan(vv) or np.isinf(vv):
+                        return default
+                    return max(1e-6, vv)
+                except Exception:
+                    return default
+
+            price_scale = float(feats["close"].iloc[-1]) if not feats.empty else (today_price or 1.0)
+            lgbm_mae_price = _safe_mae(met.get("mae_ret", met.get("mae")), default=price_scale * 0.02)
+            lstm_mae_price = _safe_mae(lstm_metrics.get("val_mae", np.nan) * price_scale, default=price_scale * 0.03)
+            w_lgbm = 1.0 / lgbm_mae_price
+            w_lstm = 1.0 / lstm_mae_price
+            if not np.isfinite(w_lgbm):
+                w_lgbm = 1.0
+            if not np.isfinite(w_lstm):
+                w_lstm = 1.0
+            ens_point = float((w_lgbm * lgbm_point + w_lstm * lstm_point) / max(1e-6, (w_lgbm + w_lstm)))
+            # Clamp to realistic band based on recent volatility (sqrt time)
+            try:
+                ret_series = df0["close"].pct_change().dropna()
+                daily_vol = float(ret_series.rolling(20).std().iloc[-1]) if len(ret_series) > 20 else float(ret_series.std())
+                if not np.isfinite(daily_vol) or daily_vol == 0:
+                    daily_vol = 0.02
+            except Exception:
+                daily_vol = 0.02
+            # tighter band: use 2.5x instead of 4.0
+            band = (today_price or float(feats["close"].iloc[-1])) * (daily_vol * max(1.0, (h ** 0.5)) * 2.5)
+            lower_cap = max(0.0, (today_price or float(feats["close"].iloc[-1])) - band)
+            upper_cap = (today_price or float(feats["close"].iloc[-1])) + band
+            ens_point = float(np.clip(ens_point, lower_cap, upper_cap))
+
             d = (datetime.utcnow().date() + timedelta(days=int(h))).isoformat()
-            horizon_by_date[d] = {"point": float(point), "range": [max(0.0, float(point - spread)), float(point + spread)]}
-            metrics_by_h[str(h)] = met
+            horizon_by_date[d] = {"point": float(ens_point), "range": [max(0.0, float(ens_point - spread_base)), float(ens_point + spread_base)]}
+            metrics_by_h[str(h)] = {"lgbm": met, "lstm": lstm_metrics, "ensemble": {"lgbm_point": float(lgbm_point), "lstm_point": float(lstm_point)}}
 
             # Try quantile model for improved ranges
             try:
@@ -688,9 +1033,10 @@ def predict_enriched(symbol: str, horizons: List[int]) -> Dict[str, Any]:
                     q80 = float(models_q["q80"].predict(arr_q)[0]) if "q80" in models_q else None
                     metrics_by_h[str(h)]["quantiles"] = {"q20": q20, "q50": q50, "q80": q80}
                     if q20 is not None and q80 is not None:
-                        horizon_by_date[d]["range"] = [max(0.0, q20), q80]
-                    if q50 is not None:
-                        horizon_by_date[d]["point"] = q50
+                        # Intersect quantile band with volatility clamp around ensemble point for tighter bounds
+                        lo = max(0.0, min(q20, ens_point))
+                        hi = max(q80, ens_point)
+                        horizon_by_date[d]["range"] = [lo, hi]
             except Exception:
                 pass
 
@@ -709,6 +1055,49 @@ def predict_enriched(symbol: str, horizons: List[int]) -> Dict[str, Any]:
                         horizon_by_date[d]["point"] = float(np.mean([horizon_by_date[d]["point"], gq50]))
             except Exception:
                 pass
+
+            # Blend with AI numeric forecast if available
+            try:
+                alpha_default = _get_blend_alpha(lname, h)
+            except Exception:
+                alpha_default = 0.7
+            ai_point_here = None
+            try:
+                # Attempt a lightweight AI forecast using headlines and signals
+                if settings.ANTHROPIC_API_KEY and titles:
+                    client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+                    prompt = (
+                        f"Stock: {symbol}. Today price: {today_price}. Given these signals {json.dumps(explain)}, "
+                        f"estimate the closing price in {h} trading days. Return only a number.\nHeadlines:\n{titles[:1000]}"
+                    )
+                    msg = client.messages.create(model=settings.ANTHROPIC_MODEL, max_tokens=64, messages=[{"role": "user", "content": prompt}])
+                    txt = str(getattr(msg, "content", "") or "").strip().split()[0]
+                    ai_point_here = float(txt)
+            except Exception:
+                ai_point_here = None
+            if ai_point_here is not None and horizon_by_date[d]["point"] is not None:
+                base_point = float(horizon_by_date[d]["point"])  # type: ignore[arg-type]
+                blended_point = float(alpha_default) * base_point + (1.0 - float(alpha_default)) * float(ai_point_here)
+                # Apply the same volatility clamp to blended value
+                try:
+                    # lower_cap/upper_cap defined earlier in the loop
+                    blended_point = float(np.clip(blended_point, lower_cap, upper_cap))  # type: ignore[name-defined]
+                except Exception:
+                    pass
+                rng = horizon_by_date[d].get("range")
+                spread_now = (rng[1] - rng[0]) / 2 if isinstance(rng, list) and len(rng) == 2 else max(1.0, blended_point * 0.02)
+                lo = float(blended_point - spread_now)
+                hi = float(blended_point + spread_now)
+                # Keep range within clamp as well if available
+                try:
+                    lo = max(lo, lower_cap)  # type: ignore[name-defined]
+                    hi = min(hi, upper_cap)  # type: ignore[name-defined]
+                except Exception:
+                    pass
+                horizon_by_date[d] = {"point": float(blended_point), "range": [lo, hi]}
+                # Track components
+                metrics_by_h[str(h)]["ensemble"]["ai_point"] = float(ai_point_here)
+                metrics_by_h[str(h)]["ensemble"]["alpha_model_vs_ai"] = float(alpha_default)
 
     result = {
         "symbol": symbol,
