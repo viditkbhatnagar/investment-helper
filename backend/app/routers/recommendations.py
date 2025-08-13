@@ -9,7 +9,7 @@ from app.services.recommendations import (
     predict_price_range,
     predict_enriched,
 )
-from app.services.recommendations import run_research
+from app.services.recommendations import run_research, compute_accuracy
 from app.services.langgraph_pipeline import run_research_graph
 from app.db import get_cache_database_sync
 from fastapi import Body
@@ -64,6 +64,15 @@ async def set_blend_weight(
 @router.get("/research-graph")
 async def research_graph(name: str = Query(..., description="Stock name")):
     return await run_research_graph(name)
+
+
+@router.get("/accuracy")
+async def rolling_accuracy(
+    name: str = Query(..., description="Stock name"),
+    horizon: int = Query(5, description="Horizon in days"),
+    window_days: int = Query(120, description="Lookback window in days"),
+):
+    return compute_accuracy(name, horizon=horizon, window_days=window_days)
 
 
 @router.get("/", response_model=List[Recommendation])

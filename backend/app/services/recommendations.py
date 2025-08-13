@@ -986,6 +986,54 @@ async def run_research(symbol: str, horizons: List[int]) -> Dict[str, Any]:
     return _json_safe(enriched_out)
 
 
+def compute_accuracy(symbol: str, horizon: int = 5, window_days: int = 120) -> Dict[str, Any]:
+    """Compute rolling MAE over last N days by comparing saved predictions vs realized price.
+    - Uses `predictions_daily` for point forecasts at date d+h
+    - Compares with historical close at that future date
+    """
+    db = get_cache_database_sync()
+    lname = symbol.strip().lower()
+    # load historical prices
+    key = {"_norm_name": lname, "_period": "10yr", "_filter": "price"}
+    hist = db.historical_data.find_one(key) or db.historical_data.find_one({"_norm_name": lname}) or {}
+    df = _extract_price_series(hist) if isinstance(hist, dict) else pd.DataFrame()
+    if df.empty:
+        return {"mae": None, "n": 0, "series": []}
+    # collect predictions in window
+    cutoff = (datetime.utcnow() - timedelta(days=window_days)).date().isoformat()
+    rows = list(db.predictions_daily.find({"_norm_name": lname, "date": {"$gte": cutoff}}).sort("date", -1))
+    errs: List[Dict[str, Any]] = []
+    for r in rows:
+        try:
+            day = r.get("date")
+            pred_map = (r.get("result") or {}).get("predictions") or {}
+            # future date = day + horizon
+            d = (pd.to_datetime(day).date() + timedelta(days=int(horizon))).isoformat()
+            pv = pred_map.get(d)
+            point = pv.get("point") if isinstance(pv, dict) else None
+            if point is None:
+                continue
+            # realized
+            if d in df.index:
+                realized = float(df.loc[d, "close"])  # type: ignore[index]
+            else:
+                # nearest
+                try:
+                    realized = float(df.loc[pd.to_datetime(d)].get("close"))  # type: ignore
+                except Exception:
+                    realized = None  # type: ignore[assignment]
+            if realized is None:
+                continue
+            err = abs(float(point) - float(realized))
+            errs.append({"date": d, "pred": float(point), "realized": float(realized), "abs_err": float(err)})
+        except Exception:
+            continue
+    if not errs:
+        return {"mae": None, "n": 0, "series": []}
+    mae = float(np.mean([e["abs_err"] for e in errs]))
+    return {"mae": mae, "n": len(errs), "series": errs}
+
+
 def _json_safe(obj: Any) -> Any:
     """Recursively convert NaN/Inf to None and numpy types to Python primitives for JSON safety."""
     if obj is None:

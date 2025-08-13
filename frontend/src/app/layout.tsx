@@ -1,4 +1,5 @@
 import "./globals.css";
+import { Toaster } from "sonner";
 import { ReactNode } from "react";
 import Link from "next/link";
 
@@ -21,6 +22,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           </div>
         </header>
         <main className="mx-auto max-w-5xl p-4">{children}</main>
+        <Toaster richColors position="top-right" />
       </body>
     </html>
   );

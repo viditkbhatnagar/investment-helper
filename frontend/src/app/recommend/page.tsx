@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import { getRecommendationsBySymbols, predictStock, researchStock, backtestStock, setBlendWeight, buildFeatures, trainModels, trainGlobalModels } from "@/lib/api";
 import Plot from "@/components/Plot";
-import Toast from "@/components/Toast";
+import { toast } from "sonner";
 
 export default function RecommendPage() {
   const [symbols, setSymbols] = useState("TCS,INFY,RELIANCE");
@@ -15,7 +15,6 @@ export default function RecommendPage() {
   const [alpha, setAlpha] = useState<string>("0.7");
   const [alphaH, setAlphaH] = useState<string>("5");
   const [days, setDays] = useState<string>("1,5,10");
-  const [toast, setToast] = useState<{ msg: string; type?: "info" | "success" | "error" } | null>(null);
 
   const fetchRecs = async () => {
     setLoading(true);
@@ -59,7 +58,7 @@ export default function RecommendPage() {
     try {
       const res = await backtestStock(name, 5, 365);
       setBt(res);
-      setToast({ msg: `Backtest done: MAE ${res?.mae ?? "-"}`, type: "success" });
+      toast.success(`Backtest done: MAE ${res?.mae ?? "-"}`);
     } finally {
       setLoading(false);
     }
@@ -71,7 +70,7 @@ export default function RecommendPage() {
       const res = await setBlendWeight(name, Number(alphaH) || 5, Number(alpha));
       // refresh research to apply weight change on next call
       setResearch(null);
-      setToast({ msg: `Saved alpha ${res?.alpha}`, type: "success" });
+      toast.success(`Saved alpha ${res?.alpha}`);
     } finally {
       setLoading(false);
     }
@@ -81,7 +80,7 @@ export default function RecommendPage() {
     setLoading(true);
     try {
       const r = await buildFeatures(name);
-      setToast({ msg: `Built features: ${r?.built ?? 0}`, type: "success" });
+      toast.success(`Built features: ${r?.built ?? 0}`);
     } finally {
       setLoading(false);
     }
@@ -91,7 +90,7 @@ export default function RecommendPage() {
     setLoading(true);
     try {
       const res = await trainModels(name);
-      setToast({ msg: `Trained local: ${name}`, type: "success" });
+      toast.success(`Trained local: ${name}`);
     } finally {
       setLoading(false);
     }
@@ -101,7 +100,7 @@ export default function RecommendPage() {
     setLoading(true);
     try {
       await trainGlobalModels();
-      setToast({ msg: "Trained global models", type: "success" });
+      toast.success("Trained global models");
     } finally {
       setLoading(false);
     }
@@ -316,7 +315,7 @@ export default function RecommendPage() {
           )}
         </div>
       )}
-      {toast && <Toast message={toast.msg} type={toast.type} onClose={() => setToast(null)} />}
+      
       <ul className="space-y-2">
         {data.map((r, idx) => (
           <li key={idx} className="rounded border bg-white p-3">
